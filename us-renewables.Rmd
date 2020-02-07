@@ -6,25 +6,198 @@ output: html_document
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE,
+                      warning=FALSE,
+                      message=FALSE)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(here)
+library(paletteer)
+library(tsibble) #time series tibbles
+library(fable)#time series forecasting
+library(feasts)#time series exploration
+library(fabletools)
+library(forecast)
+library(sf)
+library(tmap)
+library(mapview)
+library(sjmisc)
 ```
 
-## R Markdown
+## Monthly US energy consumption (renewables)
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+```{r}
+us_renew <- read_csv(here("data","renewables_cons_prod.csv")) %>% 
+  clean_names()  #I think this just makes it lowercase
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r results='hide'}
+unique(us_renew$description)  #gives you number of unique values
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+- Make the descriptoin all lowercase
+- Only keep observations where the "description" variable contains the string pattern "consumption" (to only keep the consumption data)
+  - Remove any observations where "description" variable contains "total"
+  
+```{r}
+renew_clean <- us_renew %>% 
+  mutate(description = str_to_lower(description)) %>% #overwrite the existing column so that it only contains lowercase letters
+  filter(str_detect(description,pattern="consumption")) %>% #looks for partial matches that contains the string lowercase consumption and keep it, remove all others
+  filter(!str_detect(description, pattern="total")) #remove everything with total
+
+frq(renew_clean$description)  #check
+```
+
+### Convert `yyyymm` column to a date
+
+```{r}
+renew_date <- renew_clean %>% 
+  mutate(yr_mo_day=lubridate::parse_date_time(yyyymm, "ym")) %>% 
+  mutate(month_sep=tsibble::yearmonth(yr_mo_day)) %>% #only pull the year and month
+  mutate(value=as.numeric(value)) %>% #just change to numeric
+  drop_na(month_sep,value)
+  
+class(renew_date$month_sep)
+
+#parse data using lubridate::month
+renew_parsed <- renew_date %>% 
+  mutate(month = month(yr_mo_day,label=TRUE)) %>% 
+  mutate(year=year(yr_mo_day))
+
+#490 failed to parse means it doesn't like the 490 NA's but it's still okay and worked
+```
+
+### Look at it:
+
+```{r}
+rewnew_gg <- ggplot(data=renew_date, aes(x=month_sep,
+                                         y=value,
+                                         group=description))+ #don't need this here because we have it below, but adding it anyway for pedagogy
+  geom_line(aes(color=description))
+
+rewnew_gg
+
+View(palettes_d_names) #we need 7 colors, so we need a palette with at least 7 colors
+```
+
+Update colors with paletteer palettes:
+
+```{r}
+rewnew_gg+
+  scale_color_paletteer_d("miscpalettes::sunset")
+```
+
+Convert an entire dataframe to a tsibble so that you can use feast and fable on it (for modeling and forecasting)
+
+```{r}
+renew_ts <- as_tsibble(renew_parsed,key=description, index=month_sep)
+
+#index is tsibble compatible time variable that we created, which is month_sep
+```
+
+Let's look at our time series data in a couple of different ways:
+```{r}
+renew_ts %>% autoplot(value)
+
+#autoplot does a pretty good job of creating a ggplot
+
+renew_ts %>% gg_subseries(value)
+
+#what each value looks like across months
+
+renew_ts %>% gg_season(value)
+
+#to reproduce gg_season using ggplot:
+#ggplot(data=renew_parsed, aes(x=month,y=value,group=year))+
+#  geom_line(aes(color=year))+
+#  facet_wrap(~description,
+#             ncol=1,
+#             scales="free",
+#             strip.position = "right")
+```
+
+
+### just look at the hydroelectric energy consumption
+```{r}
+hydro_ts <- renew_ts %>% 
+  filter(description=="hydroelectric power consumption")
+
+hydro_ts %>% autoplot(value)
+
+hydro_ts %>% gg_season(value)
+```
+
+
+### what if I want the quarterly average consumption for hydro?
+
+index by is specifically for tsibble data (instead of group_by)
+
+```{r}
+hydro_quarterly <- hydro_ts %>% 
+  index_by(year_qu=~(yearquarter(.))) %>%  # . = based on existing
+  summarize(avg_consumption=mean(value))
+head(hydro_quarterly)
+```
+
+### Decompose that hydro_ts
+
+```{r}
+dcmp <- hydro_ts %>% 
+  model(feasts::STL(value~season(window=5)))
+
+components(dcmp) %>% autoplot()
+
+#hist(components(dcmp$remainder))
+
+#1. actual value of obse
+#2. moving average trend
+#3. season component
+#4. residual
+```
+
+### Now, look at the ACF:
+
+This means we have some repetition in how we consume hydroelectric pattern
+
+```{r}
+hydro_ts %>% 
+  ACF(value) %>% 
+  autoplot()
+```
+
+### Now, model (forecasting using fable)
+
+Be careful with this
+
+```{r}
+hydro_model <- hydro_ts %>%
+  model(
+    ARIMA(value),
+    ETS(value)
+  ) %>% 
+  fabletools::forecast(h="4 years")
+
+#don't just run the model to fit the data, but ask fable to predict
+
+#ETS gives you another type of model and then you can compare their forecasting
+
+#run a bunch of conservative models and see if they're all lining up
+
+hydro_model %>% autoplot() #only giving us the forecasted values
+
+hydro_model %>% autoplot(filter(hydro_ts, year(month_sep)>2010))
+
+#built into arima forecasting: more uncertainty as we move towards the future
+#think really hard about how valid this might be and if the model you're using is really representing your data
+
+```
+
+### Now, let's make a world map!
+
+```{r}
+world <- read_sf(dsn=here("data","TM_WORLD_BORDERS_SIMPL-0.3-1"), #tell it what directory to find it in
+                 layer="TM_WORLD_BORDERS_SIMPL-0.3") 
+mapview(world)
+```
+
